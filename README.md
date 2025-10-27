@@ -443,10 +443,13 @@ Run the `pres_presidio_connector.py` to generate fake data for Presidio Addon:
 python pres_presidio_connector.py
 ```
 
-Then run the `saas_file_monitor.py` once to populate the database with file metadata initially:
+Then run the `saas_file_monitor.py` and `pres_presidio_scanner.py` once to populate the database with file metadata initially:
 ```bash
 python saas_file_monitor.py
 ```
+```bash
+python pres_presidio_scanner.py
+``````
 
 Run the script for dashboard `app.py`:
 ```bash
