@@ -17,3 +17,5 @@ token.json
 *.log
 *.json
 all-MiniLM-L6-v2/
+.env
+last_scan_presidio.txt

@@ -400,7 +400,8 @@ class EWMAUtils:
                 if activity_type in dynamic_config:
                     # Use dynamic values
                     user_config[activity_type] = dynamic_config[activity_type].copy()
-                    # Add the lastUpdate timestamp
+                    
+                    # Add the lastUpdate timestamp for this activity type
                     user_config[activity_type]["lastUpdate"] = current_timestamp
                     
                     logger.info(f"Initialized {activity_type} for {user_email}: {user_config[activity_type]}")

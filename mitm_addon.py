@@ -40,6 +40,14 @@ except ImportError as e:
     print(f"⚠️  WARNING: EWMA modules not found - {e}")
     EWMA_AVAILABLE = False
 
+# Import Slack/Jira notification utilities
+try:
+    from slack_jira_utils import notify_user_blocked
+    SLACK_JIRA_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  WARNING: Slack/Jira utilities not found - {e}")
+    SLACK_JIRA_AVAILABLE = False
+
 
 # ============================================================================
 # CONFIGURATION
@@ -72,7 +80,9 @@ TOKEN_CACHE_TTL = 300  # 5 minutes
 
 # Log file
 LOG_FILE = "ewma_proxy.log"
-blocked_html = f"""
+
+# HTML for unauthorized access (unsharedAccess)
+unauthorized_access_html = f"""
                 <!DOCTYPE html>
                 <html>
                 <head>
@@ -99,6 +109,41 @@ blocked_html = f"""
                         </div>
                         <div class="reason">You do not have permission to access this file.</div>
                         <div class="reason">Your access to this Google Drive resource has been restricted by the security system.</div>
+                        <hr>
+                        <small>Contact your system administrator if you believe this is an error.</small>
+                    </div>
+                </body>
+                </html>
+                """
+
+# HTML for sensitive file blocking (sensitiveCount)
+sensitive_file_blocked_html = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Sensitive File Access Blocked</title>
+                    <style>
+                        body {{ font-family: Arial, sans-serif; margin: 50px; text-align: center; background-color: #f5f5f5; }}
+                        .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                        .blocked {{ color: #d32f2f; font-size: 28px; margin-bottom: 20px; font-weight: bold; }}
+                        .icon {{ font-size: 64px; margin-bottom: 20px; }}
+                        .reason {{ color: #666; font-size: 16px; margin-bottom: 15px; line-height: 1.5; }}
+                        .timestamp {{ color: #999; font-size: 12px; margin-top: 20px; }}
+                        .service {{ color: #1a73e8; font-weight: bold; }}
+                        .alert {{ background: #ffebee; border: 1px solid #ef9a9a; padding: 15px; margin: 20px 0; border-radius: 5px; }}
+                        .details {{ background: #f8f9fa; padding: 15px; border-radius: 5px; margin-top: 20px; font-size: 14px; color: #666; }}
+                        hr {{ border: none; border-top: 1px solid #eee; margin: 20px 0; }}
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="icon">⚠️</div>
+                        <div class="blocked"><span class="service">Sensitive File</span> Access Blocked</div>
+                        <div class="alert">
+                            <strong>High-Risk File Access Restricted</strong>
+                        </div>
+                        <div class="reason">This file has been classified as sensitive with a high security risk level.</div>
+                        <div class="reason">Your access to sensitive files has been restricted due to suspicious activity patterns detected by the security system.</div>
                         <hr>
                         <small>Contact your system administrator if you believe this is an error.</small>
                     </div>
@@ -149,6 +194,7 @@ class EWMAProxy:
             self.file_activity_collection = self.file_info_db['FileActivityLogs']
             self.ewma_config_db = self.mongo_client['EWMAconfig']
             self.blocked_users_collection = self.ewma_config_db['blockedUsers']
+            self.blocked_user_activities_collection = self.ewma_config_db['blockedUserActivities']
             self.initialize_blocked_users_document()
             log("✅ MongoDB connected successfully")
         except Exception as e:
@@ -157,12 +203,10 @@ class EWMAProxy:
             self.user_cookies_collection = None
             self.file_activity_collection = None
             self.blocked_users_collection = None
+            self.blocked_user_activities_collection = None
         
         # Token to email cache: {token: (email, timestamp)}
         self.token_cache = {}
-        
-        # Pending deletions: {request_hash: {original_request, timestamp}}
-        self.pending_deletions = {}
         
         # Statistics
         self.stats = {
@@ -175,6 +219,14 @@ class EWMAProxy:
         }
         self.permission_cache = {}
         self.PERMISSION_CACHE_TTL = 60
+        
+        # Cache for sensitive file access detection (to prevent duplicate triggers)
+        self.sensitive_file_cache = {}
+        self.SENSITIVE_FILE_CACHE_TTL = 0  # 0 seconds cooldown for same file
+        
+        # Cache for activity logging deduplication (prevent logging same activity multiple times)
+        self.activity_log_cache = {}
+        self.ACTIVITY_LOG_CACHE_TTL = 5  # 5 seconds cooldown for same activity
         
         log(f"✅ EWMA Module: {'Active' if EWMA_AVAILABLE else 'Disabled'}")
         log("="*80)
@@ -201,6 +253,53 @@ class EWMAProxy:
                 log("📋 blockedUsers document already exists")
         except Exception as e:
             log(f"❌ Failed to initialize blockedUsers document: {e}")
+    def log_blocked_user_activity(self, email: str, activity_type: str, file_id: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        """
+        Log activity performed by a blocked user.
+        Includes deduplication to prevent logging the same activity multiple times.
+        
+        Args:
+            email: User email address
+            activity_type: Activity type being attempted
+            file_id: Optional file ID being accessed
+            details: Optional additional details about the activity
+        """
+        if self.blocked_user_activities_collection is None or not email:
+            return
+        
+        try:
+            # Create a unique key for this activity to prevent duplicates
+            cache_key = f"{email}:{activity_type}:{file_id or 'none'}:{int(time.time() / self.ACTIVITY_LOG_CACHE_TTL)}"
+            
+            # Check if we already logged this activity recently
+            if cache_key in self.activity_log_cache:
+                log(f"⏭️  Skipping duplicate activity log: {email} - {activity_type}")
+                return
+            
+            # Mark this activity as logged
+            self.activity_log_cache[cache_key] = time.time()
+            
+            # Clean up old cache entries (older than TTL)
+            current_time = time.time()
+            self.activity_log_cache = {
+                k: v for k, v in self.activity_log_cache.items() 
+                if current_time - v < self.ACTIVITY_LOG_CACHE_TTL * 2
+            }
+            
+            activity_log = {
+                'email': email,
+                'activity_type': activity_type,
+                'timestamp': datetime.now().isoformat(),
+                'file_id': file_id,
+                'details': details or {}
+            }
+            
+            self.blocked_user_activities_collection.insert_one(activity_log)
+            log(f"📝 Logged blocked user activity: {email} attempted {activity_type}")
+            
+        except Exception as e:
+            log(f"❌ Failed to log blocked user activity: {e}")
+    
     def add_blocked_user(self, email: str, activity_type: str):
         """
         Add user email to blocked users list for specific activity type.
@@ -241,6 +340,36 @@ class EWMAProxy:
             
             if result.modified_count > 0 or result.upserted_id:
                 log(f"🚫 Added {email} to blocked users for {activity_type}")
+                
+                # Send notification to Slack and Jira
+                if SLACK_JIRA_AVAILABLE:
+                    try:
+                        # Define wrapper function to capture exceptions in thread
+                        def send_notification_wrapper():
+                            try:
+                                log(f"🚀 Starting notification thread for {email} - {activity_type}")
+                                result = notify_user_blocked(email, activity_type, force=True)
+                                log(f"✅ Notification completed: {result.get('message', 'Unknown')}")
+                                if result.get('success'):
+                                    log(f"   Jira: {result.get('jira_ticket', 'N/A')}")
+                                    log(f"   Slack: {'✅' if result.get('slack_sent') else '❌'}")
+                                    log(f"   Chart: {'✅' if result.get('chart_uploaded') else '❌'}")
+                                else:
+                                    log(f"❌ Notification failed: {result.get('message', 'Unknown error')}")
+                            except Exception as thread_error:
+                                log(f"❌ Exception in notification thread: {thread_error}")
+                                import traceback
+                                log(f"Stack trace: {traceback.format_exc()}")
+                        
+                        # Run notification in background thread to avoid blocking proxy
+                        notification_thread = threading.Thread(
+                            target=send_notification_wrapper,
+                            daemon=True
+                        )
+                        notification_thread.start()
+                        log(f"📤 Notification thread started for {email} - {activity_type}")
+                    except Exception as notif_error:
+                        log(f"⚠️  Failed to start notification thread: {notif_error}")
             
         except Exception as e:
             log(f"❌ Failed to add blocked user: {e}")
@@ -469,6 +598,80 @@ class EWMAProxy:
         except Exception as e:
             log(f"❌ Error extracting file ID: {e}")
             return None
+    
+    def is_user_blocked(self, email: str, activity_type: Optional[str] = None) -> bool:
+        """
+        Check if user is currently blocked for any activity or a specific activity type.
+        
+        Args:
+            email: User email address
+            activity_type: Optional - specific activity to check ('sensitiveCount', 'unsharedAccess', 'downloadCount', 'deleteCount')
+                          If None, checks if user is blocked in ANY activity type
+        
+        Returns True if user is blocked, False otherwise.
+        """
+        if self.blocked_users_collection is None or not email:
+            return False
+        
+        try:
+            # Get the blockedUsers document (there's only one)
+            blocked_doc = self.blocked_users_collection.find_one()
+            
+            if not blocked_doc:
+                return False
+            
+            # If checking for specific activity type
+            if activity_type:
+                blocked_list = blocked_doc.get(activity_type, [])
+                is_blocked = email in blocked_list
+                if is_blocked:
+                    log(f"🚨 User {email} is BLOCKED for {activity_type}")
+                return is_blocked
+            
+            # Check if user is in ANY blocked list
+            activity_types = ['sensitiveCount', 'unsharedAccess', 'downloadCount', 'deleteCount']
+            for act_type in activity_types:
+                blocked_list = blocked_doc.get(act_type, [])
+                if email in blocked_list:
+                    log(f"🚨 User {email} is BLOCKED for {act_type}")
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            log(f"❌ Error checking if user is blocked: {e}")
+            return False
+    
+    def is_user_blocked_for_any_activity(self, email: str) -> bool:
+        """
+        Check if user is blocked for ANY activity type.
+        This is used to determine if we should log all their activities.
+        
+        Args:
+            email: User email address
+        
+        Returns True if user is blocked for any activity, False otherwise.
+        """
+        return self.is_user_blocked(email, activity_type=None)
+    
+    def get_file_risk_level(self, file_id: str) -> Optional[str]:
+        """
+        Get the risk level of a file from FileActivityLogs collection.
+        Returns: 'low', 'medium', 'high', 'critical', or None if not found
+        """
+        if self.file_activity_collection is None or not file_id:
+            return None
+        
+        try:
+            file_doc = self.file_activity_collection.find_one({"file_id": file_id})
+            if file_doc:
+                risk_level = file_doc.get("current_risk_level", "low").lower()
+                return risk_level
+            return None
+        except Exception as e:
+            log(f"❌ Error getting file risk level: {e}")
+            return None
+    
     def check_file_permission(self, email: str, file_id: str, use_cache:bool = True) -> bool:
         """
         Check if user has permission to access the file.
@@ -726,27 +929,7 @@ class EWMAProxy:
             except:
                 content = str(flow.request.content).lower()
         
-        # 1. DELETION (deleteCount)
-        # Only check for actual deletion requests, not account info requests
-        
-        # Pattern 1: DELETE method to /files/
-        if method == 'DELETE' and '/files/' in path:
-            return 'deleteCount'
-        
-        # Pattern 2: PATCH with trashed:true to /files/ endpoint
-        if method == 'PATCH' and '/files/' in path and ('"trashed":true' in content or '"trashed": true' in content):
-            return 'deleteCount'
-        
-        # Pattern 3: POST to batch endpoint with trashed:true (MOST COMMON for browser)
-        # Make sure it's the batch/drive endpoint specifically
-        if method == 'POST' and '/batch/drive' in path and ('"trashed":true' in content or '"trashed": true' in content):
-            return 'deleteCount'
-        
-        # Pattern 4: Explicit trash endpoint only (NOT any URL with 'trash')
-        if method in ['POST', 'PUT', 'PATCH'] and path.startswith('/trash'):
-            return 'deleteCount'
-        
-        # 2. DOWNLOAD (downloadCount)
+        # 1. DOWNLOAD (downloadCount)
         # Pattern 1: File download from drive.usercontent.google.com
         if flow.request.pretty_host == 'drive.usercontent.google.com':
             if method == 'POST' and '/uc?id=' in path:
@@ -755,38 +938,73 @@ class EWMAProxy:
                 return 'downloadCount'
         
         # Pattern 2: API downloads with alt=media or export
-        if 'alt=media' in url or '/export' in path or 'exportlinks' in path:
+        elif 'alt=media' in url or '/export' in path or 'exportlinks' in path:
             log(f"📥 DOWNLOAD detected (API): {flow.request.pretty_url}")
             self.stats['downloads_detected'] += 1
             return 'downloadCount'
         
         # Pattern 3: Generic download parameter
-        if method == 'GET' and 'download' in url:
+        elif method == 'GET' and 'download' in url:
             log(f"📥 DOWNLOAD detected (generic): {flow.request.pretty_url}")
             self.stats['downloads_detected'] += 1
             return 'downloadCount'
         
-        # 3. PERMISSION CHANGES (sensitiveCount)
-        # Check permissions endpoint first (highest priority)
-        if '/permissions' in path:
-            # Distinguish between permission CHANGES and permission CHECKS
-            if method in ['POST', 'PATCH', 'PUT', 'DELETE']:
-                log(f"🔐 Permission CHANGE detected in path: {path}")
-                return 'sensitiveCount'
-            elif method in ['GET', 'OPTIONS']:
-                log(f"🔍 Permission CHECK detected (GET/OPTIONS): {path}")
-                return 'permissionCheck'  # New activity type for permission checks
+        # 3. SENSITIVE FILE ACCESS (sensitiveCount)
+        # Check if file being accessed has high/critical risk level
+        # First extract file_id from the request
+        file_id = None
         
-        # Check for permission-related content (but exclude account info)
-        if method in ['POST', 'PATCH', 'PUT'] and '/v1/account' not in path:
-            if 'permission' in content or '"role"' in content:
-                # Make sure it's actually a permission change
-                if 'share' in content or 'reader' in content or 'writer' in content or 'commenter' in content:
-                    log(f"🔐 Permission change detected in content")
-                    return 'sensitiveCount'
+        # Pattern 1: /d/{fileId}/ in Google Docs URLs
+        match = re.search(r'/d/([a-zA-Z0-9_-]{20,})', path)
+        if match:
+            file_id = match.group(1)
+        
+        # Pattern 2: /files/{fileId} in API URLs
+        if not file_id:
+            match = re.search(r'/files/([a-zA-Z0-9_-]{20,})', path)
+            if match:
+                file_id = match.group(1)
+        
+        # Pattern 3: ?id= or &id= parameter
+        if not file_id:
+            match = re.search(r'[?&]id=([a-zA-Z0-9_-]{20,})', url)
+            if match:
+                file_id = match.group(1)
+        
+        # If we have a file_id, check its risk level
+        if file_id and self.file_activity_collection is not None and "uc?id" in path:
+            try:
+                # Check cache first to prevent duplicate detections
+                cached = self.sensitive_file_cache.get(file_id)
+                if cached:
+                    risk_level, timestamp = cached
+                    age = time.time() - timestamp
+                    if age < self.SENSITIVE_FILE_CACHE_TTL:
+                        # Recently detected, skip to avoid duplicate tracking
+                        log(f"📦 Sensitive file cache hit: {file_id} (detected {age:.1f}s ago) - skipping")
+                        return None  # Don't trigger sensitiveCount again
+                
+                # Use case-insensitive regex to match file_id
+                file_doc = self.file_activity_collection.find_one({"file_id": {"$regex": f"^{file_id}$", "$options": "i"}})
+                
+                if file_doc:
+                    current_risk_level = file_doc.get("current_risk_level", "").upper()
+                    if current_risk_level in ["HIGH", "CRITICAL"]:
+                        # Cache this detection
+                        self.sensitive_file_cache[file_id] = (current_risk_level, time.time())
+                        log(f"🔴 SENSITIVE FILE ACCESS detected - File has {current_risk_level} risk level")
+                        return 'sensitiveCount'
+            except Exception as e:
+                log(f"⚠️  Error checking file risk level: {e}")
+        
+        # Permission checks (for monitoring, not for sensitiveCount)
+        if '/permissions' in path:
+            if method in ['GET', 'OPTIONS']:
+                log(f"🔍 Permission CHECK detected (GET/OPTIONS): {path}")
+                return 'permissionCheck'
         
         # 4. FILE ACCESS (unsharedAccess)
-        if '/files/' in path:
+        if '/file/' in path:
             if method in ['GET', 'POST', 'PATCH']:
                 # Exclude metadata/batch endpoints
                 if '/batch' not in path and '/about' not in path and '/permissions' not in path:
@@ -812,71 +1030,157 @@ class EWMAProxy:
     
     def handle_deletion_request(self, flow: http.HTTPFlow) -> bool:
         """
-        Handle deletion request by modifying trashed:true → trashed:false.
-        Stores original request for later execution after EWMA check.
-        Returns True if this was a deletion request.
+        Handle deletion request to drivefrontend-pa.clients6.google.com/v1/items:update.
+        1. Check payload to differentiate delete (0 at position 14) vs refresh (1 at position 14)
+        2. Extract cookies and get user email
+        3. Check if user is blocked for deleteCount
+        4. If blocked, drop the request (don't forward)
+        5. If not blocked, update EWMA score and allow
+        Returns True if deletion request was processed (blocked or allowed).
         """
-        activity_type = self.detect_activity_type(flow)
-        if activity_type != 'deleteCount':
+        # Check if this is the deletion endpoint
+        if 'drivefrontend-pa.clients6.google.com' not in flow.request.pretty_host:
             return False
         
-        log(f"🗑️  DELETION DETECTED: {flow.request.pretty_url}")
+        if '/v1/items:update' not in flow.request.path:
+            return False
         
-        # Store original request
-        request_hash = self.get_request_hash(flow.request)
-        self.pending_deletions[request_hash] = {
-            'url': flow.request.pretty_url,
-            'method': flow.request.method,
-            'headers': dict(flow.request.headers),
-            'content': flow.request.content,
-            'timestamp': time.time()
-        }
+        if flow.request.method != 'POST':
+            return False
         
-        # Modify request to prevent immediate deletion
-        if flow.request.content:
-            try:
-                content_str = flow.request.text
-                # Replace trashed:true with trashed:false
-                modified_content = content_str.replace('"trashed":true', '"trashed":false')
-                modified_content = modified_content.replace('"trashed": true', '"trashed": false')
-                flow.request.text = modified_content
-                
-                self.stats['deletions_intercepted'] += 1
-                log(f"✏️  Modified: trashed:true → trashed:false (Hash: {request_hash[:8]})")
-                
-            except Exception as e:
-                log(f"❌ Error modifying deletion request: {e}")
+        # Check payload to differentiate delete vs refresh request
+        try:
+            payload = json.loads(flow.request.text)
+            # Navigate to position 14 in the payload array structure
+            # payload[0][0][14] should be 0 for delete, 1 for refresh
+            if isinstance(payload, list) and len(payload) > 0:
+                if isinstance(payload[0], list) and len(payload[0]) > 0:
+                    if isinstance(payload[0][0], list) and len(payload[0][0]) > 14:
+                        value_at_14 = payload[0][0][14]
+                        
+                        if value_at_14 == 1:
+                            # This is a REFRESH request, not a delete - allow it to pass through
+                            log(f"🔄 REFRESH REQUEST detected (position 14 = 1) - allowing without tracking")
+                            return False  # Let it pass through normally
+                        
+                        if value_at_14 == 0:
+                            # This is a DELETE request - proceed with blocking logic
+                            log(f"🗑️  DELETE REQUEST detected (position 14 = 0)")
+                        else:
+                            # Unknown value at position 14
+                            log(f"⚠️  Unknown value at position 14: {value_at_14} - treating as potential delete")
+        except Exception as e:
+            log(f"⚠️  Error parsing payload: {e} - proceeding with caution")
+        
+        log(f"🗑️  DELETION REQUEST DETECTED: {flow.request.pretty_url}")
+        
+        # Extract cookies from request
+        cookies_data = self.extract_cookies_from_request(flow)
+        
+        if not cookies_data:
+            log(f"⚠️  No cookies found in deletion request - allowing by default")
+            return False
+        
+        # Get user email from cookies
+        email = self.get_email_from_cookies(cookies_data)
+        
+        if not email:
+            log(f"⚠️  Could not identify user from cookies - allowing by default")
+            return False
+        
+        log(f"✉️  User identified: {email}")
+        
+        # Check if user is blocked for deleteCount
+        is_blocked = self.is_user_blocked(email, activity_type='deleteCount')
+        is_blocked_any = self.is_user_blocked_for_any_activity(email)
+        
+        if is_blocked:
+            # User is blocked - DROP the request (don't forward it)
+            log(f"🚫 DELETION BLOCKED: {email} is blocked for deleteCount")
+            
+            # Log this blocked activity
+            self.log_blocked_user_activity(
+                email=email,
+                activity_type='deleteCount',
+                file_id=None,
+                details={'url': flow.request.pretty_url, 'method': flow.request.method, 'block_point': 'deletion_handler', 'status': 'blocked'}
+            )
+            
+            flow.response = http.Response.make(
+                403,
+                b"Access Denied: Your account has been restricted from deleting files due to suspicious activity patterns.",
+                {"Content-Type": "text/plain"}
+            )
+            self.stats['deletions_blocked'] += 1
+            return True
+        
+        # If user is blocked for any other activity, log this attempt (even though it's allowed)
+        if is_blocked_any and not is_blocked:
+            log(f"📝 Logging activity for blocked user: {email} - deleteCount (allowed)")
+            self.log_blocked_user_activity(
+                email=email,
+                activity_type='deleteCount',
+                file_id=None,
+                details={'url': flow.request.pretty_url, 'method': flow.request.method, 'block_point': 'deletion_handler', 'status': 'allowed'}
+            )
+        
+        # User is NOT blocked - update EWMA score and allow the request to proceed
+        log(f"📊 Updating EWMA score for {email} - deleteCount")
+        is_allowed = self.track_and_check_activity(email, 'deleteCount')
+        
+        if not is_allowed:
+            # EWMA flagged this as suspicious - BLOCK
+            log(f"🚫 DELETION BLOCKED by EWMA: {email}")
+            flow.response = http.Response.make(
+                403,
+                b"Access Denied: Suspicious deletion pattern detected.",
+                {"Content-Type": "text/plain"}
+            )
+            self.stats['deletions_blocked'] += 1
+            return True
+        
+        # Allow deletion - manually forward request WITHOUT going through proxy
+        log(f"✅ Deletion ALLOWED for {email} - forwarding request (bypassing proxy)")
+        
+        try:
+            # Create session that bypasses proxy completely
+            session = requests.Session()
+            session.trust_env = False  # Don't use proxy settings from environment
+            session.proxies = {
+                'http': None,
+                'https': None,
+                'no_proxy': '*'
+            }  # Explicitly disable all proxies
+            
+            # Forward the request
+            response = session.request(
+                method=flow.request.method,
+                url=flow.request.pretty_url,
+                headers=dict(flow.request.headers),
+                data=flow.request.content,
+                timeout=30
+            )
+            
+            # Return the response to the client
+            flow.response = http.Response.make(
+                response.status_code,
+                response.content,
+                dict(response.headers)
+            )
+            
+            log(f"✅ Deletion forwarded successfully - Status: {response.status_code}")
+            self.stats['deletions_intercepted'] += 1
+            self.stats['activities_tracked'] += 1
+            
+        except Exception as e:
+            log(f"❌ Error forwarding deletion request: {e}")
+            flow.response = http.Response.make(
+                500,
+                b"Internal Error: Failed to process deletion request.",
+                {"Content-Type": "text/plain"}
+            )
         
         return True
-    
-    def schedule_actual_deletion(self, deletion_data: dict):
-        """
-        Schedule the actual deletion to be executed after 20 seconds.
-        This runs in a separate thread.
-        """
-        def delayed_delete():
-            time.sleep(20)
-            
-            try:
-                log(f"⏰ Executing delayed deletion to {deletion_data['url'][:50]}...")
-                session = requests.Session()
-                session.trust_env = False
-                
-                response = session.request(
-                    method=deletion_data['method'],
-                    url=deletion_data['url'],
-                    headers=deletion_data['headers'],
-                    data=deletion_data['content'],
-                    timeout=10
-                )
-                
-                log(f"✅ Delayed deletion executed - Status: {response.status_code}")
-                
-            except Exception as e:
-                log(f"❌ Failed to execute delayed deletion: {e}")
-        
-        thread = threading.Thread(target=delayed_delete, daemon=True)
-        thread.start()
     
     # ========================================================================
     # EWMA TRACKING METHODS
@@ -932,6 +1236,58 @@ class EWMAProxy:
         log(f"\n{'='*80}")
         log(f"📨 REQUEST: {flow.request.method} {flow.request.pretty_url[:80]}")
         
+        # ===== EARLY CHECK: Block users who are blocked for sensitiveCount from accessing high/critical files =====
+        # Extract file ID first
+        file_id = self.extract_file_id_from_request(flow)
+        
+        if file_id:
+            # Get email from token or cookies
+            token = self.extract_bearer_token(flow.request.headers)
+            email = None
+            
+            if token:
+                email = self.get_email_for_api_request(token)
+            else:
+                cookies_data = self.extract_cookies_from_request(flow)
+                if cookies_data:
+                    email = self.get_email_from_cookies(cookies_data)
+            
+            if email:
+                # Check if user is blocked for sensitiveCount
+                is_blocked_sensitive = self.is_user_blocked(email, activity_type='sensitiveCount')
+                
+                if is_blocked_sensitive:
+                    # User is blocked for sensitiveCount - check file risk level
+                    risk_level = self.get_file_risk_level(file_id)
+                    log(f"🚨 BLOCKED USER (sensitiveCount) accessing file - Risk Level: {risk_level}")
+                    
+                    if risk_level in ['high', 'critical']:
+                        log(f"🚫 BLOCKING ACCESS: {email} is blocked for sensitiveCount and file has {risk_level.upper()} risk")
+                        
+                        # Log this blocked activity (early check - before activity type detection)
+                        self.log_blocked_user_activity(
+                            email=email,
+                            activity_type='sensitiveCount',
+                            file_id=file_id,
+                            details={
+                                'url': flow.request.pretty_url,
+                                'method': flow.request.method,
+                                'risk_level': risk_level,
+                                'block_point': 'early_check',
+                                'status': 'blocked'
+                            }
+                        )
+                        
+                        flow.response = http.Response.make(
+                            403,
+                            sensitive_file_blocked_html.encode('utf-8'),
+                            {"Content-Type": "text/html; charset=utf-8"}
+                        )
+                        self.stats['requests_blocked'] += 1
+                        return
+                    else:
+                        log(f"✅ File has {risk_level or 'unknown'} risk - allowing access")
+        
         # Detect activity type first
         activity_type = self.detect_activity_type(flow)
         
@@ -947,6 +1303,29 @@ class EWMAProxy:
                 email = self.get_email_for_api_request(token)
                 if email:
                     log(f"✉️  Email from Bearer token: {email}")
+                    
+                    # Check if user is already blocked
+                    is_blocked = self.is_user_blocked(email, activity_type='downloadCount')
+                    is_blocked_any = self.is_user_blocked_for_any_activity(email)
+                    
+                    if is_blocked:
+                        log(f"🚫 Download BLOCKED: {email} is already blocked for downloadCount")
+                        
+                        # Log this blocked activity
+                        self.log_blocked_user_activity(
+                            email=email,
+                            activity_type='downloadCount',
+                            file_id=file_id,
+                            details={'url': flow.request.pretty_url, 'method': flow.request.method, 'block_point': 'api_download', 'status': 'blocked'}
+                        )
+                        
+                        flow.response = http.Response.make(
+                            403,
+                            b"Access Denied: Suspicious download pattern detected",
+                            {"Content-Type": "text/plain"}
+                        )
+                        return
+                    
                     # Track and check with EWMA IMMEDIATELY
                     is_allowed = self.track_and_check_activity(email, 'downloadCount')
                     if not is_allowed:
@@ -957,6 +1336,17 @@ class EWMAProxy:
                             {"Content-Type": "text/plain"}
                         )
                         return
+                    
+                    # If user is blocked for any other activity, log this attempt (even though it's allowed)
+                    if is_blocked_any and not is_blocked:
+                        log(f"📝 Logging activity for blocked user: {email} - downloadCount (allowed)")
+                        self.log_blocked_user_activity(
+                            email=email,
+                            activity_type='downloadCount',
+                            file_id=file_id,
+                            details={'url': flow.request.pretty_url, 'method': flow.request.method, 'block_point': 'api_download', 'status': 'allowed'}
+                        )
+                    
                     self.stats['activities_tracked'] += 1
                     return  # Download allowed, continue
             
@@ -976,6 +1366,28 @@ class EWMAProxy:
                     if email:
                         log(f"✉️  Email from cookies: {email}")
                         
+                        # Check if user is already blocked
+                        is_blocked = self.is_user_blocked(email, activity_type='downloadCount')
+                        is_blocked_any = self.is_user_blocked_for_any_activity(email)
+                        
+                        if is_blocked:
+                            log(f"🚫 Download BLOCKED: {email} is already blocked for downloadCount")
+                            
+                            # Log this blocked activity
+                            self.log_blocked_user_activity(
+                                email=email,
+                                activity_type='downloadCount',
+                                file_id=file_id,
+                                details={'url': flow.request.pretty_url, 'method': flow.request.method, 'block_point': 'browser_download', 'status': 'blocked'}
+                            )
+                            
+                            flow.response = http.Response.make(
+                                403,
+                                b"Access Denied: Suspicious download pattern detected",
+                                {"Content-Type": "text/plain"}
+                            )
+                            return
+                        
                         # Track and check with EWMA IMMEDIATELY IN REQUEST PHASE
                         is_allowed = self.track_and_check_activity(email, 'downloadCount')
                         
@@ -988,6 +1400,16 @@ class EWMAProxy:
                             )
                             return
                         
+                        # If user is blocked for any other activity, log this attempt (even though it's allowed)
+                        if is_blocked_any and not is_blocked:
+                            log(f"📝 Logging activity for blocked user: {email} - downloadCount (allowed)")
+                            self.log_blocked_user_activity(
+                                email=email,
+                                activity_type='downloadCount',
+                                file_id=file_id,
+                                details={'url': flow.request.pretty_url, 'method': flow.request.method, 'block_point': 'browser_download', 'status': 'allowed'}
+                            )
+                        
                         log(f"✅ Download ALLOWED for {email}")
                         self.stats['activities_tracked'] += 1
                     else:
@@ -997,10 +1419,121 @@ class EWMAProxy:
                 
                 return  # Download processed (allowed or blocked)
         
-        # Check if this is a browser deletion request
-        elif activity_type == 'deleteCount' and not self.extract_bearer_token(flow.request.headers):
-            # Browser deletion - handle in response phase
-            self.handle_deletion_request(flow)
+        # ===== HANDLE DELETION REQUESTS =====
+        # Check for deletion endpoint (drivefrontend-pa.clients6.google.com/v1/items:update)
+        if self.handle_deletion_request(flow):
+            return  # Deletion request processed (blocked or allowed)
+        
+        # ===== HANDLE SENSITIVE FILE ACCESS (EWMA TRACKING ONLY) =====
+        elif activity_type == 'sensitiveCount':
+            log(f"🔴 Sensitive file access detected - tracking with EWMA")
+            
+            # Extract file ID to check risk level
+            file_id = self.extract_file_id_from_request(flow)
+            
+            # Get email from token or cookies
+            token = self.extract_bearer_token(flow.request.headers)
+            email = None
+            
+            if token:
+                email = self.get_email_for_api_request(token)
+                log(f"✉️  Email from Bearer token: {email}")
+            else:
+                cookies_data = self.extract_cookies_from_request(flow)
+                if cookies_data:
+                    email = self.get_email_from_cookies(cookies_data)
+                    log(f"✉️  Email from cookies: {email}")
+            
+            if email:
+                # FIRST: Check if user is blocked for sensitiveCount specifically and file is high/critical risk
+                is_blocked = self.is_user_blocked(email, activity_type='sensitiveCount')  # Check ONLY for sensitiveCount
+                is_blocked_any = self.is_user_blocked_for_any_activity(email)
+                
+                if is_blocked and file_id:
+                    risk_level = self.get_file_risk_level(file_id)
+                    log(f"🔍 User is BLOCKED for sensitiveCount - File risk level: {risk_level}")
+                    
+                    if risk_level in ['high', 'critical']:
+                        log(f"🚫 BLOCKED USER (sensitiveCount) attempting to access {risk_level.upper()} risk file - ACCESS DENIED")
+                        
+                        # Log this blocked activity
+                        self.log_blocked_user_activity(
+                            email=email,
+                            activity_type='sensitiveCount',
+                            file_id=file_id,
+                            details={
+                                'url': flow.request.pretty_url,
+                                'method': flow.request.method,
+                                'risk_level': risk_level,
+                                'block_point': 'sensitive_handler',
+                                'status': 'blocked'
+                            }
+                        )
+                        
+                        flow.response = http.Response.make(
+                            403,
+                            sensitive_file_blocked_html.encode('utf-8'),
+                            {"Content-Type": "text/html; charset=utf-8"}
+                        )
+                        self.stats['requests_blocked'] += 1
+                        return
+                    else:
+                        log(f"✅ Blocked user (sensitiveCount) accessing {risk_level or 'unknown'} risk file - ALLOWED")
+                
+                # SECOND: Track with EWMA and check allowance
+                log(f"📊 EWMA Tracking: {email} → sensitiveCount")
+                is_allowed = self.track_and_check_activity(email, 'sensitiveCount')
+                
+                if not is_allowed:
+                    log(f"🚫 Sensitive file access BLOCKED by EWMA for {email}")
+                    
+                    # Log this blocked activity (EWMA blocked)
+                    risk_level = self.get_file_risk_level(file_id) if file_id else None
+                    self.log_blocked_user_activity(
+                        email=email,
+                        activity_type='sensitiveCount',
+                        file_id=file_id,
+                        details={
+                            'url': flow.request.pretty_url,
+                            'method': flow.request.method,
+                            'risk_level': risk_level,
+                            'block_point': 'sensitive_handler_ewma',
+                            'status': 'blocked'
+                        }
+                    )
+                    
+                    flow.response = http.Response.make(
+                        403,
+                        sensitive_file_blocked_html.encode('utf-8'),
+                        {"Content-Type": "text/html; charset=utf-8"}
+                    )
+                    return
+                
+                # THIRD: Log for blocked users (other activities) - only if access was ACTUALLY allowed
+                # If user is blocked for ANY activity, log this attempt
+                # Only log as "allowed" if the user is NOT blocked for sensitiveCount (since we're in sensitiveCount handler)
+                if is_blocked_any and not is_blocked:
+                    # User is blocked for other activities but NOT for sensitiveCount, and access is allowed
+                    log(f"📝 Logging activity for blocked user: {email} - sensitiveCount (allowed)")
+                    risk_level = self.get_file_risk_level(file_id) if file_id else None
+                    self.log_blocked_user_activity(
+                        email=email,
+                        activity_type='sensitiveCount',
+                        file_id=file_id,
+                        details={
+                            'url': flow.request.pretty_url,
+                            'method': flow.request.method,
+                            'risk_level': risk_level,
+                            'block_point': 'sensitive_handler',
+                            'status': 'allowed'
+                        }
+                    )
+                
+                log(f"✅ Sensitive file access ALLOWED (tracked) for {email}")
+                self.stats['activities_tracked'] += 1
+            else:
+                log(f"⚠️  Could not identify user - allowing by default")
+            
             return
         # ===== HANDLE FILE ACCESS (PERMISSION CHECK) =====
         elif activity_type == 'permissionCheck':
@@ -1027,7 +1560,7 @@ class EWMAProxy:
                 log(f"⚠️  Could not identify user - blocking by default")
                 flow.response = http.Response.make(
                     401,
-                    blocked_html.encode('utf-8'),
+                    unauthorized_access_html.encode('utf-8'),
                     {"Content-Type": "text/html; charset=utf-8"}
                 )
                 return
@@ -1038,6 +1571,20 @@ class EWMAProxy:
             if not has_permission:
                 # BLOCK permission check for unauthorized users
                 log(f"🚫 #1 Permission check BLOCKED: {email} → File {file_id}")
+                
+                # Log this blocked activity
+                self.log_blocked_user_activity(
+                    email=email,
+                    activity_type='unsharedAccess',
+                    file_id=file_id,
+                    details={
+                        'url': flow.request.pretty_url,
+                        'method': flow.request.method,
+                        'reason': 'permission_check_failed',
+                        'block_point': 'permission_check'
+                    }
+                )
+                
                 accept_header = flow.request.headers.get("accept", "").lower()
                 
                 if "application/json" in accept_header or "/json" in accept_header:
@@ -1056,7 +1603,7 @@ class EWMAProxy:
                 else:
                     flow.response = http.Response.make(
                         403,
-                        blocked_html.encode('utf-8'),
+                        unauthorized_access_html.encode('utf-8'),
                         {"Content-Type": "text/html; charset=utf-8"}
                     )
                 return
@@ -1093,27 +1640,46 @@ class EWMAProxy:
             
             # Check if user has permission to access this file
             has_permission = self.check_file_permission(email, file_id)
+            is_blocked_any = self.is_user_blocked_for_any_activity(email)
             
             if not has_permission:
-                # BLOCK unauthorized access
-                log(f"🚨 Unauthorized access attempt detected!")
+                # User doesn't have permission - this is UNAUTHORIZED ACCESS
+                log(f"🚨 Unauthorized access attempt detected! {email} trying to access file without permission")
                 log(f"📊 EWMA Tracking: {email} → unsharedAccess")
+                
+                # Log this blocked activity
+                self.log_blocked_user_activity(
+                    email=email,
+                    activity_type='unsharedAccess',
+                    file_id=file_id,
+                    details={
+                        'url': flow.request.pretty_url,
+                        'method': flow.request.method,
+                        'block_point': 'unshared_access_handler',
+                        'status': 'blocked'
+                    }
+                )
+                
+                # Track with EWMA and add to blocked list
                 if EWMA_AVAILABLE:
                     update_user_activity_ewma(email, 'unsharedAccess')
                     self.add_blocked_user(email, 'unsharedAccess')
-                log(f"#2 🚫 UNAUTHORIZED ACCESS BLOCKED: {email} → File {file_id}")
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                log(f"🚫 UNAUTHORIZED ACCESS BLOCKED: {email} → File {file_id}")
                 
                 flow.response = http.Response.make(
                     403,
-                    blocked_html.encode('utf-8'),
+                    unauthorized_access_html.encode('utf-8'),
                     {"Content-Type": "text/html; charset=utf-8"}
                 )
                 self.stats['unauthorized_access_blocked'] += 1
                 self.stats['activities_tracked'] += 1
+                return
     
             else:
-                log(f"✅ File access ALLOWED for {email}")
+                # User HAS permission - allow access
+                log(f"✅ File access ALLOWED for {email} (user has permission)")
+                return
         # Check if this is an API request (has Bearer token)
         token = self.extract_bearer_token(flow.request.headers)
         
@@ -1160,55 +1726,6 @@ class EWMAProxy:
         """
         # Handle authentication responses (for any host)
         self.handle_auth_response(flow)
-        
-        # Only process Google Drive requests for activity tracking
-        if not self.is_google_drive_request(flow):
-            return        
-        
-        # ===== HANDLE DELETION RESPONSES =====
-        request_hash = self.get_request_hash(flow.request)
-        if request_hash not in self.pending_deletions:
-            return
-        
-        log(f"\n{'='*80}")
-        log(f"📬 RESPONSE for deletion request (Hash: {request_hash[:8]})")
-        
-        # Extract email from response
-        if not flow.response or not flow.response.text:
-            log(f"⚠️  No response text available")
-            return
-        
-        # LOG THE RESPONSE CONTENT FOR DEBUGGING
-        log(f"📄 Response content (first 2000 chars):")
-        log(f"{flow.response.text[:2000]}")
-        log(f"{'='*80}")
-        
-        email = self.extract_email_from_response(flow.response.text)
-        if not email:
-            log(f"⚠️  Could not extract email from deletion response")
-            return
-        
-        log(f"✉️  Email extracted: {email}")
-        
-        # Track deletion activity with EWMA
-        is_allowed = self.track_and_check_activity(email, 'deleteCount')
-        
-        # Get the original deletion data
-        deletion_data = self.pending_deletions[request_hash]
-        
-        if is_allowed:
-            # Activity is allowed - schedule actual deletion after 20 seconds
-            log(f"⏰ Scheduling deletion for {email} in 20 seconds...")
-            self.schedule_actual_deletion(deletion_data)
-        else:
-            # Activity is blocked - do NOT schedule deletion
-            log(f"🚫 Deletion BLOCKED for {email} - file will NOT be deleted")
-            self.stats['deletions_blocked'] += 1
-        
-        # Remove from pending
-        del self.pending_deletions[request_hash]
-        
-        self.stats['activities_tracked'] += 1
     
     # ========================================================================
     # LIFECYCLE METHODS

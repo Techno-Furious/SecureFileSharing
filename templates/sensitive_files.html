@@ -326,13 +326,7 @@
         z-index: 1;
       }
 
-      /* Hide unwanted summary cards */
-      #totalEntitiesCard,
-      #avgRiskScoreCard,
-      #totalEntities,
-      #avgRiskScore {
-        display: none !important;
-      }
+
     </style>
   </head>
   <body>
@@ -342,11 +336,12 @@
           <a class="nav-link" href="/">Dashboard</a>
         </li>
         <li class="nav-item">
-          <a class="nav-link" href="/user-based">User Based</a>
-        </li>
-        <li class="nav-item">
           <a class="nav-link" href="/file-based">File Based</a>
         </li>
+        <li class="nav-item">
+          <a class="nav-link" href="/user-based">User Based</a>
+        </li>
+        
         <li class="nav-item">
           <a class="nav-link active" href="/sensitive_files">Sensitive Files</a>
         </li>
@@ -359,8 +354,8 @@
       <div class="row mb-4">
         <div class="col-md-3">
           <div class="stats-card">
-            <h2 id="totalFiles">0</h2>
-            <h5>Total Scanned Files</h5>
+            <h2 id="criticalRiskFiles">0</h2>
+            <h5>Critical Risk Files</h5>
           </div>
         </div>
         <div class="col-md-3">
@@ -371,14 +366,14 @@
         </div>
         <div class="col-md-3">
           <div class="stats-card">
-            <h2 id="totalEntities">0</h2>
-            <h5>Total Entities Found</h5>
+            <h2 id="moderateRiskFiles">0</h2>
+            <h5>Moderate Risk Files</h5>
           </div>
         </div>
         <div class="col-md-3">
           <div class="stats-card">
-            <h2 id="avgRiskScore">0</h2>
-            <h5>Average Risk Score</h5>
+            <h2 id="lowRiskFiles">0</h2>
+            <h5>Low Risk Files</h5>
           </div>
         </div>
       </div>
@@ -485,19 +480,13 @@
 
       function updateDashboard() {
         const stats = calculateStats();
-        document.getElementById("totalFiles").textContent = stats.totalFiles;
+        document.getElementById("criticalRiskFiles").textContent = stats.criticalRiskFiles;
         document.getElementById("highRiskFiles").textContent =
           stats.highRiskFiles;
-
-        // Hide the cards we no longer want to show (in case they are still in the DOM)
-        const entCard = document
-          .getElementById("totalEntities")
-          ?.closest(".col-md-3");
-        if (entCard) entCard.style.display = "none";
-        const avgCard = document
-          .getElementById("avgRiskScore")
-          ?.closest(".col-md-3");
-        if (avgCard) avgCard.style.display = "none";
+        document.getElementById("moderateRiskFiles").textContent =
+          stats.moderateRiskFiles;
+        document.getElementById("lowRiskFiles").textContent =
+          stats.lowRiskFiles;
 
         // Update owner filter options
         const owners = [...new Set(sensitiveFiles.map((file) => file.owner))];
@@ -511,20 +500,29 @@
 
       function calculateStats() {
         // Count unique files by ID
-        const uniqueIds = new Set();
+        const criticalRiskIds = new Set();
         const highRiskIds = new Set();
+        const moderateRiskIds = new Set();
+        const lowRiskIds = new Set();
 
         sensitiveFiles.forEach((f) => {
-          uniqueIds.add(f.file_id);
           const risk = f.details.changes[0].risk_level;
-          if (risk === "HIGH" || risk === "CRITICAL") {
+          if (risk === "CRITICAL") {
+            criticalRiskIds.add(f.file_id);
+          } else if (risk === "HIGH") {
             highRiskIds.add(f.file_id);
+          } else if (risk === "MODERATE") {
+            moderateRiskIds.add(f.file_id);
+          } else if (risk === "LOW") {
+            lowRiskIds.add(f.file_id);
           }
         });
 
         return {
-          totalFiles: uniqueIds.size,
+          criticalRiskFiles: criticalRiskIds.size,
           highRiskFiles: highRiskIds.size,
+          moderateRiskFiles: moderateRiskIds.size,
+          lowRiskFiles: lowRiskIds.size,
         };
       }
 

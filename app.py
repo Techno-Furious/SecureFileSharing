@@ -795,6 +795,9 @@ def unblock_user():
                     else:
                         reset_values[time_window] = value
                 
+                # Add lastUpdate with current timestamp
+                reset_values['lastUpdate'] = datetime.now().strftime("%H:%M:%S %d-%m-%Y")
+                
                 update_fields[field_name] = reset_values
                 app.logger.info(f"📊 Will reset userConfig.{field_name} to: {reset_values}")
         
@@ -825,6 +828,38 @@ def unblock_user():
         
     except Exception as e:
         app.logger.error(f"Error unblocking user: {str(e)}\n{traceback.format_exc()}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/blocked-user-activities/<email>')
+def get_blocked_user_activities(email):
+    """Get all activities performed by a blocked user."""
+    try:
+        # Decode email (in case it's URL encoded)
+        email = urllib.parse.unquote(email)
+        
+        app.logger.info(f"Fetching activities for blocked user: {email}")
+        
+        # MongoDB connection
+        ewma_config_db = client['EWMAconfig']
+        blocked_user_activities_collection = ewma_config_db['blockedUserActivities']
+        
+        # Fetch all activities for this user, sorted by timestamp (newest first)
+        activities = list(blocked_user_activities_collection.find(
+            {"email": email},
+            {"_id": 0}  # Exclude MongoDB _id field
+        ).sort("timestamp", -1))
+        
+        app.logger.info(f"Found {len(activities)} activities for {email}")
+        
+        return jsonify({
+            "status": "success",
+            "email": email,
+            "activity_count": len(activities),
+            "activities": activities
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error fetching blocked user activities: {str(e)}\n{traceback.format_exc()}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
