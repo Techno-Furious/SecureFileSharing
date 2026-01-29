@@ -537,32 +537,7 @@
         <div class="col-md-3">
           <div class="card chart-card">
             <div class="card-body">
-              <div class="chart-title-container">
-                <h5 class="card-title">Changes by Type</h5>
-                <div class="btn-group" role="group">
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-outline-primary active"
-                    id="typeChartAll"
-                  >
-                    All
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-outline-primary"
-                    id="typeChartGDrive"
-                  >
-                    GDrive
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-outline-primary"
-                    id="typeChartDropbox"
-                  >
-                    Dropbox
-                  </button>
-                </div>
-              </div>
+              <h5 class="card-title">Changes by Type</h5>
               <div class="chart-container doughnut-container">
                 <canvas id="typeChart" width="100%" height="200"></canvas>
               </div>
@@ -570,13 +545,13 @@
           </div>
         </div>
 
-        <!-- Chart 3: Source Distribution -->
+        <!-- Chart 3: Activity by Hour -->
         <div class="col-md-3">
           <div class="card chart-card">
             <div class="card-body">
-              <h5 class="card-title">Source Distribution</h5>
-              <div class="chart-container doughnut-container">
-                <canvas id="sourceChart" width="100%" height="200"></canvas>
+              <h5 class="card-title">Activity by Hour</h5>
+              <div class="chart-container">
+                <canvas id="hourlyChart" width="100%" height="200"></canvas>
               </div>
             </div>
           </div>
@@ -772,7 +747,7 @@
       // Initialize chart variables
       window.timeChart = null;
       window.typeChart = null;
-      window.sourceChart = null;
+      window.hourlyChart = null;
       window.modifiersChart = null;
 
       // Current filters
@@ -1258,19 +1233,19 @@
           // Check if chart canvas elements exist
           const timeChartCtx = document.getElementById("timeChart");
           const typeChartCtx = document.getElementById("typeChart");
-          const sourceChartCtx = document.getElementById("sourceChart");
+          const hourlyChartCtx = document.getElementById("hourlyChart");
           const modifiersChartCtx = document.getElementById("modifiersChart");
 
           if (
             !timeChartCtx ||
             !typeChartCtx ||
-            !sourceChartCtx ||
+            !hourlyChartCtx ||
             !modifiersChartCtx
           ) {
             console.error("One or more chart canvas elements not found:", {
               timeChart: !!timeChartCtx,
               typeChart: !!typeChartCtx,
-              sourceChart: !!sourceChartCtx,
+              hourlyChart: !!hourlyChartCtx,
               modifiersChart: !!modifiersChartCtx,
             });
             return;
@@ -1317,7 +1292,6 @@
 
             // Count changes by date
             const gdriveCounts = new Array(7).fill(0);
-            const dropboxCounts = new Array(7).fill(0);
 
             // Process Google Drive logs
             if (Array.isArray(data.gdrive_logs)) {
@@ -1372,60 +1346,7 @@
               });
             }
 
-            // Process Dropbox logs
-            if (Array.isArray(data.dropbox_logs)) {
-              console.log(
-                `Processing ${data.dropbox_logs.length} Dropbox logs for time chart`
-              );
-
-              data.dropbox_logs.forEach((log, index) => {
-                try {
-                  if (!log.timestamp) {
-                    console.warn(
-                      `Missing timestamp in Dropbox log at index ${index}:`,
-                      log
-                    );
-                    return;
-                  }
-
-                  let timestamp = log.timestamp;
-                  let logDate;
-
-                  // Handle different timestamp formats
-                  if (timestamp.includes(".")) {
-                    logDate = new Date(
-                      timestamp.split(".")[0].replace(" ", "T")
-                    );
-                  } else if (timestamp.includes("T")) {
-                    logDate = new Date(timestamp);
-                  } else {
-                    logDate = new Date(timestamp.replace(" ", "T"));
-                  }
-
-                  if (isNaN(logDate.getTime())) {
-                    console.warn(
-                      `Invalid date from Dropbox timestamp "${timestamp}" at index ${index}`
-                    );
-                    return;
-                  }
-
-                  const dateStr = logDate.toISOString().split("T")[0];
-                  const dateIndex = dates.indexOf(dateStr);
-
-                  if (dateIndex !== -1) {
-                    dropboxCounts[dateIndex]++;
-                  }
-                } catch (err) {
-                  console.error(
-                    `Error processing Dropbox log at index ${index}:`,
-                    err,
-                    log
-                  );
-                }
-              });
-            }
-
-            console.log("Chart data counts:", { gdriveCounts, dropboxCounts });
+            console.log("Chart data counts:", { gdriveCounts });
 
             // Create time chart - Chart.js v4 configuration
             window.timeChart = new Chart(timeChartContext, {
@@ -1441,15 +1362,6 @@
                     fill: false,
                     borderColor: "#64b5f6",
                     backgroundColor: "rgba(100, 181, 246, 0.1)",
-                    tension: 0.4,
-                    borderWidth: 3,
-                  },
-                  {
-                    label: "Dropbox",
-                    data: dropboxCounts,
-                    fill: false,
-                    borderColor: "#4fc3f7",
-                    backgroundColor: "rgba(79, 195, 247, 0.1)",
                     tension: 0.4,
                     borderWidth: 3,
                   },
@@ -1522,12 +1434,6 @@
               }
             }
 
-            if (typeChartFilter === "all" || typeChartFilter === "dropbox") {
-              if (Array.isArray(data.dropbox_logs)) {
-                logsToProcess = logsToProcess.concat(data.dropbox_logs);
-              }
-            }
-
             console.log(
               `Processing ${logsToProcess.length} logs for type chart with filter: ${typeChartFilter}`
             );
@@ -1596,19 +1502,6 @@
                       },
                     },
                   },
-                  title: {
-                    display: true,
-                    text:
-                      typeChartFilter === "all"
-                        ? "All Sources"
-                        : typeChartFilter === "gdrive"
-                        ? "Google Drive Only"
-                        : "Dropbox Only",
-                    font: {
-                      size: 14,
-                    },
-                    color: "#ffffff",
-                  },
                 },
               },
             });
@@ -1621,77 +1514,117 @@
             console.error("Error creating filtered type chart:", error);
           }
 
-          // ---------- SOURCE CHART ----------
+          // ---------- HOURLY ACTIVITY CHART ----------
           try {
-            const sourceChartContext = sourceChartCtx.getContext("2d");
+            const hourlyChartContext = hourlyChartCtx.getContext("2d");
 
-            if (window.sourceChart) {
+            if (window.hourlyChart) {
               try {
-                window.sourceChart.clear();
-                window.sourceChart.destroy();
+                window.hourlyChart.clear();
+                window.hourlyChart.destroy();
               } catch (e) {
-                console.warn("Error destroying previous source chart:", e);
+                console.warn("Error destroying previous hourly chart:", e);
               }
-              window.sourceChart = null;
+              window.hourlyChart = null;
             }
 
-            console.log("Source chart data:", { gdriveCount, dropboxCount });
+            // Count activities by hour
+            const hourlyCounts = new Array(24).fill(0);
+            let allLogsForHourly = [];
 
-            // Create source chart - Chart.js v4 configuration
-            window.sourceChart = new Chart(sourceChartContext, {
-              type: "pie",
+            if (Array.isArray(data.gdrive_logs)) {
+              allLogsForHourly = allLogsForHourly.concat(data.gdrive_logs);
+            }
+
+            if (Array.isArray(data.dropbox_logs)) {
+              allLogsForHourly = allLogsForHourly.concat(data.dropbox_logs);
+            }
+
+            allLogsForHourly.forEach((log) => {
+              try {
+                if (!log.timestamp) return;
+
+                let logDate;
+                const timestamp = log.timestamp;
+
+                // Handle different timestamp formats
+                if (timestamp.includes(".")) {
+                  logDate = new Date(timestamp.split(".")[0] + "Z");
+                } else if (timestamp.includes("T")) {
+                  logDate = new Date(timestamp);
+                } else {
+                  logDate = new Date(timestamp);
+                }
+
+                if (!isNaN(logDate.getTime())) {
+                  const hour = logDate.getHours();
+                  hourlyCounts[hour]++;
+                }
+              } catch (err) {
+                console.error("Error processing log for hourly chart:", err);
+              }
+            });
+
+            // Create hour labels
+            const hourLabels = [];
+            for (let i = 0; i < 24; i++) {
+              const hour = i === 0 ? "12 AM" : i < 12 ? `${i} AM` : i === 12 ? "12 PM" : `${i - 12} PM`;
+              hourLabels.push(hour);
+            }
+
+            console.log("Hourly activity data:", hourlyCounts);
+
+            // Create hourly chart
+            window.hourlyChart = new Chart(hourlyChartContext, {
+              type: "bar",
               data: {
-                labels: ["Google Drive", "Dropbox"],
+                labels: hourLabels,
                 datasets: [
                   {
-                    data: [gdriveCount, dropboxCount],
-                    backgroundColor: ["#3f8cff", "#04d9ff"],
-                    borderColor: "#1e1e1e",
-                    borderWidth: 2,
+                    label: "Activities",
+                    data: hourlyCounts,
+                    backgroundColor: "#64b5f6",
+                    borderColor: "#1976d2",
+                    borderWidth: 1,
                   },
                 ],
               },
               options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: {
-                  legend: {
-                    position: "right",
-                    labels: {
-                      color: "#ffffff",
-                      padding: 20,
-                      font: {
-                        size: 14,
-                        weight: "bold",
-                      },
+                scales: {
+                  x: {
+                    ticks: {
+                      color: "#e0e0e0",
+                      font: { size: 8 },
+                      maxRotation: 45,
+                      minRotation: 45,
+                    },
+                    grid: {
+                      color: "#333333",
+                      display: false,
                     },
                   },
-                  title: {
-                    display: true,
-                    text:
-                      typeChartFilter === "all"
-                        ? "All Sources"
-                        : typeChartFilter === "gdrive"
-                        ? "Google Drive Only"
-                        : "Dropbox Only",
-                    color: "#ffffff",
-                    font: {
-                      size: 16,
-                      weight: "bold",
+                  y: {
+                    beginAtZero: true,
+                    ticks: {
+                      color: "#e0e0e0",
+                      stepSize: 1,
+                      font: { size: 10 },
                     },
+                    grid: {
+                      color: "#333333",
+                    },
+                  },
+                },
+                plugins: {
+                  legend: {
+                    display: false,
                   },
                   tooltip: {
                     callbacks: {
                       label: function (context) {
-                        const label = context.label || "";
-                        const value = context.parsed || 0;
-                        const total = context.dataset.data.reduce(
-                          (acc, val) => acc + val,
-                          0
-                        );
-                        const percentage =
-                          total > 0 ? Math.round((value / total) * 100) : 0;
-                        return `${label}: ${percentage}%`;
+                        return `${context.parsed.y} activities`;
                       },
                     },
                   },
@@ -1699,9 +1632,9 @@
               },
             });
 
-            console.log("Source chart created successfully");
+            console.log("Hourly chart created successfully");
           } catch (error) {
-            console.error("Error creating source chart:", error);
+            console.error("Error creating hourly chart:", error);
           }
 
           // ---------- TOP MODIFIERS CHART ----------
@@ -1762,18 +1695,6 @@
             const chartLabels = sortedModifiers.map((mod) => mod.name);
             const chartData = sortedModifiers.map((mod) => mod.count);
             const chartEmails = sortedModifiers.map((mod) => mod.email);
-
-            // Add "Others" category if there are more than 3 modifiers
-            const totalModifiers = Object.values(modifierCounts).length;
-            const remainingCount = Object.values(modifierCounts)
-              .sort((a, b) => b.count - a.count)
-              .slice(3)
-              .reduce((sum, mod) => sum + mod.count, 0);
-            if (totalModifiers > 3 && remainingCount > 0) {
-              chartLabels.push("Others");
-              chartData.push(remainingCount);
-              chartEmails.push("Multiple users");
-            }
 
             console.log(
               "Top modifiers data:",
@@ -1860,131 +1781,13 @@
           } catch (error) {
             console.error("Error creating modifiers chart:", error);
           }
-
-          // Update type chart based on filter
-          updateTypeChart(typeChartFilter);
-
-          // Update source distribution
-          updateSourceDistribution(gdriveCount, dropboxCount);
         } catch (error) {
           console.error("Error in overall chart update function:", error);
         }
       }
 
-      // Update source distribution
-      function updateSourceDistribution(gdriveCount, dropboxCount) {
-        try {
-          const sourceChartCtx = document.getElementById("sourceChart");
-          if (!sourceChartCtx) {
-            console.error("Source chart canvas element not found");
-            return;
-          }
-
-          const sourceChartContext = sourceChartCtx.getContext("2d");
-
-          // Properly destroy chart if it exists
-          if (window.sourceChart) {
-            try {
-              window.sourceChart.clear();
-              window.sourceChart.destroy();
-            } catch (e) {
-              console.warn("Error destroying previous source chart:", e);
-            }
-            window.sourceChart = null;
-          }
-
-          // Filter counts based on typeChartFilter
-          let filteredGdriveCount = gdriveCount;
-          let filteredDropboxCount = dropboxCount;
-
-          if (typeChartFilter === "gdrive") {
-            filteredDropboxCount = 0;
-          } else if (typeChartFilter === "dropbox") {
-            filteredGdriveCount = 0;
-          }
-
-          // If both counts are 0, show equal distribution
-          if (filteredGdriveCount === 0 && filteredDropboxCount === 0) {
-            filteredGdriveCount = 1;
-            filteredDropboxCount = 1;
-          }
-
-          console.log("Source chart data:", {
-            gdriveCount: filteredGdriveCount,
-            dropboxCount: filteredDropboxCount,
-            filter: typeChartFilter,
-          });
-
-          // Create source chart - Chart.js v4 configuration
-          window.sourceChart = new Chart(sourceChartContext, {
-            type: "pie",
-            data: {
-              labels: ["Google Drive", "Dropbox"],
-              datasets: [
-                {
-                  data: [filteredGdriveCount, filteredDropboxCount],
-                  backgroundColor: ["#3f8cff", "#04d9ff"],
-                  borderColor: "#1e1e1e",
-                  borderWidth: 2,
-                },
-              ],
-            },
-            options: {
-              responsive: true,
-              maintainAspectRatio: false,
-              plugins: {
-                legend: {
-                  position: "right",
-                  labels: {
-                    color: "#ffffff",
-                    padding: 20,
-                    font: {
-                      size: 14,
-                      weight: "bold",
-                    },
-                  },
-                },
-                title: {
-                  display: true,
-                  text:
-                    typeChartFilter === "all"
-                      ? "All Sources"
-                      : typeChartFilter === "gdrive"
-                      ? "Google Drive Only"
-                      : "Dropbox Only",
-                  color: "#ffffff",
-                  font: {
-                    size: 16,
-                    weight: "bold",
-                  },
-                },
-                tooltip: {
-                  callbacks: {
-                    label: function (context) {
-                      const label = context.label || "";
-                      const value = context.parsed || 0;
-                      const total = context.dataset.data.reduce(
-                        (acc, val) => acc + val,
-                        0
-                      );
-                      const percentage =
-                        total > 0 ? Math.round((value / total) * 100) : 0;
-                      return `${label}: ${percentage}%`;
-                    },
-                  },
-                },
-              },
-            },
-          });
-
-          console.log("Source chart created successfully");
-        } catch (error) {
-          console.error("Error creating source chart:", error);
-        }
-      }
-
-      // Function to update type chart based on filter
-      function updateTypeChart(filter) {
+      // Function to update type chart
+      function updateTypeChart() {
         try {
           if (
             !chartData ||
@@ -2013,7 +1816,7 @@
             window.typeChart = null;
           }
 
-          // Count by type based on filter
+          // Count by type
           const changeTypes = {
             new_file: 0,
             file_deleted: 0,
@@ -2022,20 +1825,12 @@
           };
 
           let logsToProcess = [];
-          if (filter === "all" || filter === "gdrive") {
-            if (Array.isArray(chartData.gdrive_logs)) {
-              logsToProcess = logsToProcess.concat(chartData.gdrive_logs);
-            }
-          }
-
-          if (filter === "all" || filter === "dropbox") {
-            if (Array.isArray(chartData.dropbox_logs)) {
-              logsToProcess = logsToProcess.concat(chartData.dropbox_logs);
-            }
+          if (Array.isArray(chartData.gdrive_logs)) {
+            logsToProcess = logsToProcess.concat(chartData.gdrive_logs);
           }
 
           console.log(
-            `Processing ${logsToProcess.length} logs for type chart with filter: ${filter}`
+            `Processing ${logsToProcess.length} logs for type chart`
           );
 
           logsToProcess.forEach((log, index) => {
@@ -2089,26 +1884,13 @@
                     },
                   },
                 },
-                title: {
-                  display: true,
-                  text:
-                    filter === "all"
-                      ? "All Sources"
-                      : filter === "gdrive"
-                      ? "Google Drive Only"
-                      : "Dropbox Only",
-                  font: {
-                    size: 14,
-                  },
-                  color: "#ffffff",
-                },
               },
             },
           });
 
-          console.log("Type chart created successfully with filter:", filter);
+          console.log("Type chart created successfully");
         } catch (error) {
-          console.error("Error creating filtered type chart:", error);
+          console.error("Error creating type chart:", error);
         }
       }
 
@@ -2248,43 +2030,8 @@
         const typeChartGDrive = document.getElementById("typeChartGDrive");
         const typeChartDropbox = document.getElementById("typeChartDropbox");
 
-        if (typeChartAll) {
-          typeChartAll.addEventListener("click", function () {
-            typeChartFilter = "all";
-            setActiveTypeChartButton(this);
-            updateTypeChart(typeChartFilter);
-          });
-        }
-
-        if (typeChartGDrive) {
-          typeChartGDrive.addEventListener("click", function () {
-            typeChartFilter = "gdrive";
-            setActiveTypeChartButton(this);
-            updateTypeChart(typeChartFilter);
-          });
-        }
-
-        if (typeChartDropbox) {
-          typeChartDropbox.addEventListener("click", function () {
-            typeChartFilter = "dropbox";
-            setActiveTypeChartButton(this);
-            updateTypeChart(typeChartFilter);
-          });
-        }
       });
-
-      // Set active button for chart filters
-      function setActiveTypeChartButton(button) {
-        // Remove active class from all buttons
-        document
-          .querySelectorAll(
-            "#typeChartAll, #typeChartGDrive, #typeChartDropbox"
-          )
-          .forEach((btn) => btn.classList.remove("active"));
-
-        // Add active class to selected button
-        button.classList.add("active");
-      } // Add this function before the updateTable function
+ // Add this function before the updateTable function
       function formatOwner(owner, log) {
         // First check if owner is directly provided
         if (owner) {
